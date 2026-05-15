@@ -14,6 +14,14 @@ static i2c_master_dev_handle_t s_dev;
 static uint16_t s_cx = 32767;
 static uint16_t s_cy = 32767;
 
+/* Where the firmware exposes the button.
+ *   Joystick (v1):  byte 4 of the 0x00 burst (one I²C txn).
+ *   Joystick2:      register 0x20 (separate read).
+ * Auto-detected at init by reading 0x20 — if it returns 0 or 1 (a plausible
+ * boolean), we use 0x20; otherwise we fall back to byte 4 of the burst. */
+static uint8_t s_btn_reg = 0x20;
+static bool    s_btn_in_burst = false;
+
 // ─── Low-level helper ─────────────────────────────────────────────────────────
 static esp_err_t read_regs(uint8_t reg, uint8_t *buf, size_t len)
 {
@@ -52,6 +60,20 @@ esp_err_t joystick2_init(void)
 
     s_cx = (uint16_t)(probe[0] | (probe[1] << 8));
     s_cy = (uint16_t)(probe[2] | (probe[3] << 8));
+
+    /* Auto-detect button register layout. Register 0x20 on the Joystick2 unit
+     * exposes a clean boolean (0 or 1). If the read returns anything else,
+     * we treat the click as byte 4 of the burst read (legacy Joystick unit). */
+    uint8_t btn_at_20 = 0xFF;
+    if (read_regs(0x20, &btn_at_20, 1) == ESP_OK && (btn_at_20 == 0 || btn_at_20 == 1)) {
+        s_btn_reg = 0x20;
+        s_btn_in_burst = false;
+        ESP_LOGI(TAG, "Button at register 0x20 (Joystick2 layout)");
+    } else {
+        s_btn_in_burst = true;
+        ESP_LOGI(TAG, "Button via burst byte[4] (legacy Joystick layout); reg 0x20=0x%02X", btn_at_20);
+    }
+
     ESP_LOGI(TAG, "Joystick2 ready. Centre X=%u Y=%u", s_cx, s_cy);
     return ESP_OK;
 }
@@ -79,8 +101,15 @@ esp_err_t joystick2_read(joystick2_data_t *out)
 
     out->x_raw = (uint16_t)(buf[0] | (buf[1] << 8));
     out->y_raw = (uint16_t)(buf[2] | (buf[3] << 8));
-    // btn byte: 0 = pressed, 1 = released (active-low from Joystick2 firmware)
-    out->btn = (buf[4] == 0);
+
+    /* Button: location depends on which Joystick variant we're talking to. */
+    if (s_btn_in_burst) {
+        out->btn = (buf[4] == 0);
+    } else {
+        uint8_t b = 1;
+        if (read_regs(s_btn_reg, &b, 1) == ESP_OK) out->btn = (b == 0);
+        else                                       out->btn = false;
+    }
 
     // Normalise relative to calibrated centre → −100 … +100
     int32_t dx = (int32_t)out->x_raw - s_cx;
